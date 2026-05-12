@@ -69,6 +69,7 @@ if ( ! function_exists( 'get_job_listings' ) ) :
 			'update_post_meta_cache' => false,
 			'cache_results'          => false,
 			'fields'                 => $args['fields'],
+			'has_password'           => false,
 		];
 
 		if ( $args['posts_per_page'] < 0 ) {
@@ -222,7 +223,8 @@ if ( ! function_exists( 'get_job_listings' ) ) :
 		// Cache results.
 		if ( apply_filters( 'get_job_listings_cache_results', $should_cache ) ) {
 			$to_hash            = wp_json_encode( $query_args );
-			$query_args_hash    = 'jm_' . md5( $to_hash . JOB_MANAGER_VERSION ) . WP_Job_Manager_Cache_Helper::get_transient_version( 'get_job_listings' );
+			$auth_state         = is_user_logged_in() ? 'u' . get_current_user_id() : 'anon';
+			$query_args_hash    = 'jm_' . md5( $to_hash . JOB_MANAGER_VERSION . $auth_state ) . WP_Job_Manager_Cache_Helper::get_transient_version( 'get_job_listings' );
 			$result             = false;
 			$cached_query_posts = get_transient( $query_args_hash );
 			if ( is_string( $cached_query_posts ) ) {
@@ -468,9 +470,6 @@ if ( ! function_exists( 'get_job_listings_keyword_search' ) ) :
 
 		if ( ! empty( $new_search ) ) {
 			$new_search = " AND ({$new_search}) ";
-			if ( ! is_user_logged_in() ) {
-				$new_search .= " AND ({$wpdb->posts}.post_password = '') ";
-			}
 		} else {
 			return $search;
 		}
@@ -1560,11 +1559,15 @@ function job_manager_upload_file( $file, $args = [] ) {
  */
 function job_manager_get_allowed_mime_types( $field = '' ) {
 	if ( 'company_logo' === $field ) {
-		$allowed_mime_types = [
-			'jpg|jpeg|jpe' => 'image/jpeg',
-			'gif'          => 'image/gif',
-			'png'          => 'image/png',
-		];
+		$allowed_mime_types = apply_filters(
+			'job_manager_company_logo_allowed_mime_types',
+			[
+				'jpg|jpeg|jpe' => 'image/jpeg',
+				'gif'          => 'image/gif',
+				'png'          => 'image/png',
+				'webp'         => 'image/webp',
+			]
+		);
 	} else {
 		$allowed_mime_types = [
 			'jpg|jpeg|jpe' => 'image/jpeg',
