@@ -3,7 +3,7 @@
         'name' => 'automattic/wp-job-manager',
         'pretty_version' => 'dev-trunk',
         'version' => 'dev-trunk',
-        'reference' => '780607eaebe053cb1e0da719dd2d135443f370a6',
+        'reference' => 'dc79ffa890d43ad854553da3dcb66ac043a0fb1f',
         'type' => 'wordpress-plugin',
         'install_path' => __DIR__ . '/../../',
         'aliases' => array(),
@@ -13,7 +13,7 @@
         'automattic/wp-job-manager' => array(
             'pretty_version' => 'dev-trunk',
             'version' => 'dev-trunk',
-            'reference' => '780607eaebe053cb1e0da719dd2d135443f370a6',
+            'reference' => 'dc79ffa890d43ad854553da3dcb66ac043a0fb1f',
             'type' => 'wordpress-plugin',
             'install_path' => __DIR__ . '/../../',
             'aliases' => array(),
