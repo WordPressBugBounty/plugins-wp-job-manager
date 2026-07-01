@@ -4,7 +4,7 @@ Tags: jobs, careers, company, hiring, job board
 Requires at least: 6.4
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 2.4.4
+Stable tag: 2.4.5
 License: GPLv3
 License URI: http://www.gnu.org/licenses/gpl-3.0.html
 
@@ -147,6 +147,11 @@ You can view (and contribute) translations via the [translate.wordpress.org](htt
 
 == Changelog ==
 
+### 2.4.5 - 2026-07-01
+* Escape URLs in two sprintf href templates with esc_url() (#2996)
+* Validate attachment ownership when reusing a company logo by ID (#2995)
+* Honor restrictive filter_post_status=publish for logged-out visitors (#2994)
+
 ### 2.4.4 - 2026-06-24
 * Fix: Restore the frontend styles and scripts that were missing from the 2.4.3 package. The 2.4.3 release was built without its compiled CSS and JavaScript, leaving the employer job dashboard unstyled and breaking frontend features such as the job application form. (#2990)
 
@@ -191,11 +196,4 @@ You can view (and contribute) translations via the [translate.wordpress.org](htt
 * fix hardcoded dashboard expiration date format
 * Dev: Fix deprecated  methods
 * Fix file input field for forms not marked as required
-
-### 2.4.0 - 2024-08-08
-* Fix job dashboard actions menu in Safari
-* Fix PHP 8.3 support
-* Remove support for Internet Explorer 11
-* Fix Wordpress 6.6 compatibility
-* Fix classic editor support for job listings
 
