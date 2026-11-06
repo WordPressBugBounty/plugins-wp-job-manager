@@ -58,6 +58,14 @@ class WP_Job_Manager_Post_Types {
 	public const CAP_EDIT_LISTINGS = 'edit_job_listings';
 
 	/**
+	 * Plugin-generated media markup kept through the untrusted-media pass, keyed by its
+	 * single-use placeholder token. See protect_listing_media_output().
+	 *
+	 * @var string[]
+	 */
+	private static $protected_media = [];
+
+	/**
 	 * Constant for the capability name used for editing others job listings.
 	 */
 	public const CAP_EDIT_OTHERS_LISTINGS = 'edit_others_job_listings';
@@ -178,6 +186,8 @@ class WP_Job_Manager_Post_Types {
 		add_filter( 'admin_head', [ $this, 'admin_head' ] );
 		add_action( 'job_manager_check_for_expired_jobs', [ $this, 'check_for_expired_jobs' ] );
 		add_action( 'job_manager_delete_old_previews', [ $this, 'delete_old_previews' ] );
+
+		add_action( 'delete_attachment', [ $this, 'keep_shared_attachment_files' ], 10, 2 );
 
 		add_action( 'transition_post_status', [ $this, 'transition_post_status' ], 10, 3 );
 
@@ -620,6 +630,123 @@ class WP_Job_Manager_Post_Types {
 	}
 
 	/**
+	 * Files that must not be removed while an attachment sharing them is deleted.
+	 *
+	 * @var string[]
+	 */
+	private static $shared_attachment_files = [];
+
+	/**
+	 * Keeps an attachment's files on disk when another attachment still references the same
+	 * file: deleting a job listing's attachment then removes only the attachment itself.
+	 *
+	 * @since 2.4.10
+	 * @access private
+	 *
+	 * @param int     $attachment_id Attachment being deleted.
+	 * @param WP_Post $attachment    Attachment post, when available.
+	 */
+	public function keep_shared_attachment_files( $attachment_id, $attachment = null ) {
+		$attachment = $attachment ? $attachment : get_post( $attachment_id );
+
+		if ( ! $attachment || ! $attachment->post_parent || self::PT_LISTING !== get_post_type( $attachment->post_parent ) ) {
+			return;
+		}
+
+		$relative_path = get_post_meta( $attachment_id, '_wp_attached_file', true );
+
+		if ( ! $relative_path ) {
+			return;
+		}
+
+		$other_attachments = get_posts(
+			[
+				'post_type'        => 'attachment',
+				'post_status'      => 'any',
+				'post__not_in'     => [ $attachment_id ],
+				'posts_per_page'   => 1,
+				'fields'           => 'ids',
+				'meta_key'         => '_wp_attached_file', // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key
+				'meta_value'       => $relative_path, // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_value
+				'suppress_filters' => false,
+			]
+		);
+
+		if ( ! $other_attachments ) {
+			return;
+		}
+
+		self::$shared_attachment_files = array_merge( self::$shared_attachment_files, $this->attachment_file_paths( $attachment_id ) );
+
+		add_filter( 'wp_delete_file', [ $this, 'skip_shared_file_delete' ] );
+	}
+
+	/**
+	 * Keeps a file out of an attachment deletion when it was marked as still referenced.
+	 *
+	 * @since 2.4.10
+	 * @access private
+	 *
+	 * @param string $path File about to be deleted.
+	 * @return string Empty string to keep the file, or the path unchanged.
+	 */
+	public function skip_shared_file_delete( $path ) {
+		$key = array_search( wp_normalize_path( (string) $path ), self::$shared_attachment_files, true );
+
+		if ( false === $key ) {
+			return $path;
+		}
+
+		unset( self::$shared_attachment_files[ $key ] );
+
+		return '';
+	}
+
+	/**
+	 * Every file on disk that deleting the attachment would remove.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return string[] Normalized absolute paths.
+	 */
+	private function attachment_file_paths( $attachment_id ) {
+		$paths = [];
+		$file  = get_attached_file( $attachment_id, true );
+
+		if ( ! $file ) {
+			return $paths;
+		}
+
+		$paths[] = $file;
+		$dir     = dirname( $file );
+		$meta    = wp_get_attachment_metadata( $attachment_id );
+
+		$original_image = wp_get_original_image_path( $attachment_id, true );
+		if ( $original_image ) {
+			$paths[] = $original_image;
+		}
+
+		if ( is_array( $meta ) && ! empty( $meta['sizes'] ) ) {
+			foreach ( $meta['sizes'] as $size ) {
+				if ( ! empty( $size['file'] ) ) {
+					$paths[] = path_join( $dir, $size['file'] );
+				}
+			}
+		}
+
+		$backup_sizes = get_post_meta( $attachment_id, '_wp_attachment_backup_sizes', true );
+
+		if ( is_array( $backup_sizes ) ) {
+			foreach ( $backup_sizes as $size ) {
+				if ( ! empty( $size['file'] ) ) {
+					$paths[] = path_join( $dir, $size['file'] );
+				}
+			}
+		}
+
+		return array_map( 'wp_normalize_path', $paths );
+	}
+
+	/**
 	 * Restricts listing content written by an author who can't post unfiltered HTML: the content
 	 * is limited to the listing's allowed tags, and its shortcodes are not expanded.
 	 *
@@ -634,8 +761,22 @@ class WP_Job_Manager_Post_Types {
 			return $content;
 		}
 
+		return self::restrict_content_html( $content );
+	}
+
+	/**
+	 * Restricts HTML content to the listing's allowed tags, with shortcodes and blocks kept
+	 * as the text that was written instead of being expanded.
+	 *
+	 * @since 2.4.10
+	 *
+	 * @param string $content HTML content.
+	 * @return string
+	 */
+	public static function restrict_content_html( $content ) {
 		$content = wp_kses( $content, self::restricted_allowed_html() );
-		$content = strip_shortcodes( $content );
+		// Not strip_shortcodes(): that would remove the text inside enclosing shortcodes with them.
+		$content = job_manager_unwrap_shortcodes( $content );
 
 		// Drop block delimiters so dynamic blocks aren't rendered from the content later.
 		$content = preg_replace( '/<!--\s*\/?wp:.*?-->/s', '', $content );
@@ -648,11 +789,12 @@ class WP_Job_Manager_Post_Types {
 	 * Whether a listing's content is trusted to use shortcodes, blocks and media.
 	 *
 	 * @since 2.4.9
+	 * @since 2.4.10 Public.
 	 *
 	 * @param WP_Post $post Job listing.
 	 * @return bool
 	 */
-	private static function is_trusted_listing( $post ) {
+	public static function is_trusted_listing( $post ) {
 		/**
 		 * Filter whether a listing's content may use shortcodes, blocks and media.
 		 *
@@ -661,9 +803,10 @@ class WP_Job_Manager_Post_Types {
 		 * expanded, keep media elements, and get media previews in the editor.
 		 *
 		 * @since 2.4.9
+		 * @since 2.4.10 `$post` can be null, when a submission is checked before it is saved.
 		 *
-		 * @param bool    $allow_shortcodes True when the listing author can edit job listings.
-		 * @param WP_Post $post             Job listing.
+		 * @param bool         $allow_shortcodes True when the listing author can edit job listings.
+		 * @param WP_Post|null $post             Job listing, or null when the submission has no post yet.
 		 */
 		return (bool) apply_filters( 'job_manager_job_description_allow_shortcodes', user_can( (int) $post->post_author, self::CAP_EDIT_LISTINGS ), $post );
 	}
@@ -697,16 +840,20 @@ class WP_Job_Manager_Post_Types {
 	/**
 	 * The allowed tags for content from an author who can't post unfiltered HTML. Media elements
 	 * are excluded: media players build interactive menus from their markup, so they aren't safe
-	 * with values an untrusted submitter supplies.
+	 * with values an untrusted submitter supplies. Iframes are excluded too: they would put a
+	 * page of the submitter's choosing inside the listing, and in front of a moderator opening
+	 * a pending listing. Embeds for trusted providers don't come from the author's markup, so
+	 * they are unaffected.
 	 *
 	 * @since 2.4.9
+	 * @since 2.4.10 `iframe` is no longer allowed.
 	 *
 	 * @return array
 	 */
 	private static function restricted_allowed_html() {
 		$allowed_html = self::kses_allowed_html();
 
-		unset( $allowed_html['video'], $allowed_html['audio'], $allowed_html['source'], $allowed_html['track'] );
+		unset( $allowed_html['video'], $allowed_html['audio'], $allowed_html['source'], $allowed_html['track'], $allowed_html['iframe'] );
 
 		return $allowed_html;
 	}
@@ -730,7 +877,69 @@ class WP_Job_Manager_Post_Types {
 
 		// Only media elements are removed: on the single listing page this runs over the whole
 		// listing template, which has buttons and forms that must be kept.
-		return self::remove_media_elements( $content );
+		$content = self::remove_media_elements( $content );
+
+		return self::restore_protected_media( $content );
+	}
+
+	/**
+	 * Keeps a piece of plugin-generated media markup through strip_untrusted_listing_media().
+	 *
+	 * The media pass can't tell the plugin's own markup, such as the company video player built
+	 * by WordPress from the listing's saved URL, from markup the author wrote. Plugin-generated
+	 * markup is swapped for a single-use random placeholder before the pass and swapped back
+	 * after it. The placeholder is generated server-side at render time, so content the author
+	 * wrote beforehand can never name one.
+	 *
+	 * Trusted listings, and output printed outside the filtered content (where no media pass
+	 * runs), are returned unchanged. Shortcodes are expanded before the swap: the restored
+	 * markup re-enters the content after `do_shortcode` has already run.
+	 *
+	 * @since 2.4.10
+	 *
+	 * @param string           $html Plugin-generated markup to keep.
+	 * @param int|WP_Post|null $post Job listing the markup belongs to. Defaults to the global post.
+	 * @return string The markup, or the placeholder that will be swapped back for it.
+	 */
+	public static function protect_listing_media_output( $html, $post = null ) {
+		$post = self::get_listing_for_content( get_post( $post ) );
+
+		if ( ! $post || self::is_trusted_listing( $post ) || ( ! doing_filter( 'the_content' ) && ! doing_filter( 'the_job_description' ) ) ) {
+			return $html;
+		}
+
+		$token = 'wpjm-protected-media-' . wp_generate_password( 24, false );
+
+		self::$protected_media[ $token ] = do_shortcode( $html );
+
+		return '<!-- ' . $token . ' -->';
+	}
+
+	/**
+	 * Swaps back the markup protected by protect_listing_media_output(). Placeholders are
+	 * single-use, and an unknown placeholder, such as one written into listing content by its
+	 * author, is left alone as the inert comment it is.
+	 *
+	 * @since 2.4.10
+	 *
+	 * @param string $content Content after the media pass.
+	 * @return string
+	 */
+	private static function restore_protected_media( $content ) {
+		if ( empty( self::$protected_media ) || false === strpos( $content, 'wpjm-protected-media-' ) ) {
+			return $content;
+		}
+
+		foreach ( self::$protected_media as $token => $html ) {
+			$placeholder = '<!-- ' . $token . ' -->';
+
+			if ( false !== strpos( $content, $placeholder ) ) {
+				$content = str_replace( $placeholder, $html, $content );
+				unset( self::$protected_media[ $token ] );
+			}
+		}
+
+		return $content;
 	}
 
 	/**
@@ -1089,6 +1298,10 @@ class WP_Job_Manager_Post_Types {
 		}
 
 		$query->set( 'has_password', false );
+
+		// Match job_feed(): feeds serve published listings only. Without this, every
+		// post status registered 'public' — such as 'expired' — is included on feed queries.
+		$query->set( 'post_status', 'publish' );
 
 		// View-capability gate — see job_feed(): restrict a denied viewer to their own
 		// listings (none for anonymous) so the default RSS / Atom endpoints do not expose

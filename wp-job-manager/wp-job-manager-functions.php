@@ -1665,6 +1665,8 @@ function job_manager_upload_file( $file, $args = [] ) {
 			$uploaded_file->type      = $upload['type'];
 			$uploaded_file->size      = $file['size'];
 			$uploaded_file->extension = substr( strrchr( $uploaded_file->name, '.' ), 1 );
+
+			job_manager_record_submitted_upload( $uploaded_file->url );
 		}
 	}
 
@@ -1672,6 +1674,157 @@ function job_manager_upload_file( $file, $args = [] ) {
 	$job_manager_uploading_file = '';
 
 	return $uploaded_file;
+}
+
+/**
+ * Keeps the list of file URLs uploaded through `job_manager_upload_file()` during the
+ * current request.
+ *
+ * @since 2.4.10
+ * @access private
+ *
+ * @param string|null $add_url Optional. File URL to add to the list.
+ * @return string[] The URLs of the files uploaded so far during this request.
+ */
+function job_manager_request_uploaded_urls( $add_url = null ) {
+	static $urls = [];
+
+	if ( null !== $add_url ) {
+		$urls[] = (string) $add_url;
+	}
+
+	return $urls;
+}
+
+/**
+ * Gets the key that ties form uploads by a visitor without an account to the browser
+ * that made them, optionally creating its cookie.
+ *
+ * @since 2.4.10
+ * @access private
+ *
+ * @param bool $create Whether to create the key when the visitor does not have one yet.
+ * @return string The key, or an empty string when there is none and one could not be created.
+ */
+function job_manager_uploads_tracking_key( $create = false ) {
+	$cookie_name = 'wp-job-manager-uploaded-files-key';
+
+	// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Only used when it matches the expected key format exactly.
+	$key = isset( $_COOKIE[ $cookie_name ] ) ? wp_unslash( $_COOKIE[ $cookie_name ] ) : '';
+
+	if ( is_string( $key ) && 1 === preg_match( '/^[a-zA-Z0-9]{32}$/', $key ) ) {
+		return $key;
+	}
+
+	if ( ! $create || headers_sent() ) {
+		return '';
+	}
+
+	$key = wp_generate_password( 32, false );
+
+	setcookie(
+		$cookie_name,
+		$key,
+		[
+			'expires'  => time() + DAY_IN_SECONDS,
+			'path'     => COOKIEPATH,
+			'domain'   => COOKIE_DOMAIN,
+			'secure'   => is_ssl(),
+			'httponly' => true,
+			'samesite' => 'Lax',
+		]
+	);
+
+	$_COOKIE[ $cookie_name ] = $key;
+
+	return $key;
+}
+
+/**
+ * Remembers a file uploaded through `job_manager_upload_file()` for the visitor who
+ * uploaded it.
+ *
+ * The submission forms post an uploaded file's URL back on a later request — after an
+ * AJAX upload, or when another field failed validation — possibly before a listing
+ * exists to save it on. This record is what lets a form accept those URLs while
+ * rejecting files the visitor did not upload. Records are kept against the visitor's
+ * account, or against their browser for visitors without one, and expire after a day;
+ * a visitor whose record has lapsed re-uploads the file.
+ *
+ * @since 2.4.10
+ * @access private
+ *
+ * @param string $url URL of the uploaded file.
+ */
+function job_manager_record_submitted_upload( $url ) {
+	// Escaped like the posted file URLs the record is compared against.
+	$url = esc_url( $url, [ 'http', 'https' ] );
+
+	if ( '' === $url ) {
+		return;
+	}
+
+	job_manager_request_uploaded_urls( $url );
+
+	if ( is_user_logged_in() ) {
+		$transient = 'jm_uploads_user_' . get_current_user_id();
+	} else {
+		$key = job_manager_uploads_tracking_key( true );
+
+		if ( '' === $key ) {
+			return;
+		}
+
+		$transient = 'jm_uploads_' . md5( $key );
+	}
+
+	$urls   = get_transient( $transient );
+	$urls   = is_array( $urls ) ? array_filter( $urls, 'is_string' ) : [];
+	$urls[] = $url;
+
+	set_transient( $transient, array_slice( array_values( array_unique( $urls ) ), -50 ), DAY_IN_SECONDS );
+}
+
+/**
+ * Whether the current visitor uploaded the given file through a WP Job Manager form.
+ *
+ * True for files uploaded during this request, and for files uploaded on earlier
+ * requests — recorded against the visitor's account, or against their browser for
+ * visitors without one. The browser record is checked for signed-in users too: a
+ * guest's uploads must stay usable when they register or log in partway through a
+ * submission.
+ *
+ * @since 2.4.10
+ *
+ * @param string $file_url File URL, escaped by `esc_url()`.
+ * @return bool
+ */
+function job_manager_is_submitter_uploaded_file( $file_url ) {
+	if ( ! is_string( $file_url ) || '' === $file_url ) {
+		return false;
+	}
+
+	if ( in_array( $file_url, job_manager_request_uploaded_urls(), true ) ) {
+		return true;
+	}
+
+	if ( is_user_logged_in() ) {
+		$urls = get_transient( 'jm_uploads_user_' . get_current_user_id() );
+
+		if ( is_array( $urls ) && in_array( $file_url, $urls, true ) ) {
+			return true;
+		}
+	}
+
+	$key = job_manager_uploads_tracking_key();
+
+	if ( '' === $key ) {
+		return false;
+	}
+
+	$urls = get_transient( 'jm_uploads_' . md5( $key ) );
+
+	return is_array( $urls ) && in_array( $file_url, $urls, true );
 }
 
 /**
@@ -1792,6 +1945,54 @@ function calculate_job_expiry( $job_id, $return_datetime = false, $from_timestam
 }
 
 /**
+ * Removes shortcodes from content, keeping the inner content of enclosing shortcodes.
+ *
+ * Unlike WordPress's `strip_shortcodes()`, which removes an enclosing shortcode together with
+ * everything between its opening and closing tags, this drops only the tags themselves:
+ * `[wrap]text[/wrap]` becomes `text`, recursively for shortcodes nested inside. Self-closing
+ * shortcodes, which have no inner content, are removed entirely, and escaped `[[shortcode]]`
+ * text keeps its literal form. As with `strip_shortcodes()`, only registered shortcodes match.
+ *
+ * @since 2.4.10
+ *
+ * @param string $content Content to remove shortcodes from.
+ * @return string Content with shortcode tags removed and their inner content kept.
+ */
+function job_manager_unwrap_shortcodes( $content ) {
+	global $shortcode_tags;
+
+	if ( ! is_string( $content ) || false === strpos( $content, '[' ) || empty( $shortcode_tags ) || ! is_array( $shortcode_tags ) ) {
+		return $content;
+	}
+
+	// Match only the registered shortcodes present in the content, as strip_shortcodes() does.
+	preg_match_all( '@\[([^<>&/\[\]\x00-\x20=]++)@', $content, $matches );
+	$tagnames = array_intersect( array_keys( $shortcode_tags ), $matches[1] );
+
+	if ( empty( $tagnames ) ) {
+		return $content;
+	}
+
+	$content = do_shortcodes_in_html_tags( $content, true, $tagnames );
+	$pattern = get_shortcode_regex( $tagnames );
+
+	$content = preg_replace_callback(
+		"/$pattern/",
+		function ( $m ) {
+			// An escaped [[shortcode]] keeps its literal text, as in strip_shortcode_tag().
+			if ( '[' === $m[1] && ']' === $m[6] ) {
+				return (string) substr( $m[0], 1, -1 );
+			}
+
+			return $m[1] . job_manager_unwrap_shortcodes( isset( $m[5] ) ? $m[5] : '' ) . $m[6];
+		},
+		$content
+	);
+
+	return unescape_invalid_shortcodes( $content );
+}
+
+/**
  * Duplicates a listing.
  *
  * @since 1.25.0
@@ -1851,7 +2052,7 @@ function job_manager_duplicate_listing( $post_id ) {
 	if ( ! empty( $post_meta ) ) {
 		$post_meta = wp_list_pluck( $post_meta, 'meta_value', 'meta_key' );
 
-		$default_duplicate_ignore_keys = [ '_filled', '_featured', '_promoted', '_job_expires', '_job_duration', '_package_id', '_user_package_id', '_edit_lock', '_submitting_key', '_tracked_submitted', '_tracked_approved' ];
+		$default_duplicate_ignore_keys = [ '_filled', '_featured', '_promoted', '_job_expires', '_job_duration', '_package_id', '_user_package_id', '_edit_lock', '_submitting_key', '_tracked_submitted', '_tracked_approved', '_job_edited', '_job_schedule_listing' ];
 		$duplicate_ignore_keys         = apply_filters( 'job_manager_duplicate_listing_ignore_keys', $default_duplicate_ignore_keys, true );
 
 		foreach ( $post_meta as $meta_key => $meta_value ) {

@@ -90,16 +90,18 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 		// Listing renewal support.
 		WP_Job_Manager_Helper_Renewals::instance( $this );
 
-		// Recaptcha support.
+		// Recaptcha support. Validated before the posted fields are read, since reading the
+		// fields writes any uploaded files; covers normal submissions and draft saves alike.
 		WP_Job_Manager\WP_Job_Manager_Recaptcha::instance()->maybe_enable_recaptcha(
 			'job_manager_enable_recaptcha_job_submission',
 			[ 'submit_job_form_end' ],
-			[ 'submit_job_form_validate_fields', 'submit_draft_job_form_validate_fields' ]
+			[ 'submit_job_form_validate_request' ]
 		);
 
 		if ( $this->use_agreement_checkbox() ) {
 			add_action( 'submit_job_form_end', [ $this, 'display_agreement_checkbox_field' ] );
-			add_filter( 'submit_job_form_validate_fields', [ $this, 'validate_agreement_checkbox' ] );
+			// Also before the fields are read; draft saves skip it, as they always have.
+			add_filter( 'submit_job_form_validate_request', [ $this, 'validate_agreement_checkbox' ], 10, 2 );
 		}
 
 		$this->steps = (array) apply_filters(
@@ -521,7 +523,8 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 
 							// Check mime types.
 							if ( ! empty( $field['allowed_mime_types'] ) ) {
-								$file_url  = current( explode( '?', $file_url ) );
+								// Neither the query string nor the fragment is part of the file name.
+								$file_url  = current( preg_split( '/[?#]/', (string) $file_url ) );
 								$file_info = wp_check_filetype( $file_url );
 
 								if ( ! is_numeric( $file_url ) && $file_info && ! in_array( $file_info['type'], $field['allowed_mime_types'], true ) ) {
@@ -530,7 +533,7 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 								}
 							}
 
-							// Attachment IDs are validated for ownership in validate_attachment_ownership().
+							// File values are validated for ownership in validate_attachment_ownership().
 							if ( is_numeric( $file_url ) ) {
 								continue;
 							}
@@ -748,6 +751,25 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 				}
 
 				throw new Exception( __( 'You must be signed in to post a new listing.', 'wp-job-manager' ) );
+			}
+
+			/**
+			 * Validate the job submission request before the posted fields are read.
+			 *
+			 * Reading the posted fields writes any uploaded files, so checks that gate the
+			 * submission as a whole — the captcha, the agreement checkbox — belong on this
+			 * filter, not on `submit_job_form_validate_fields`, which runs after the files
+			 * are already on disk.
+			 *
+			 * @since 2.4.10
+			 *
+			 * @param bool|WP_Error $is_valid        Whether the request is valid.
+			 * @param bool          $is_saving_draft Whether the submission is a draft save.
+			 */
+			$request_validation = apply_filters( 'submit_job_form_validate_request', true, $is_saving_draft );
+
+			if ( is_wp_error( $request_validation ) ) {
+				throw new Exception( $request_validation->get_error_message() );
 			}
 
 			// Init fields.
@@ -983,14 +1005,15 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 	}
 
 	/**
-	 * Validates that every attachment referenced by ID in the posted file fields is owned by
-	 * (or editable by) the current user.
+	 * Validates that every file referenced in the posted file fields — by attachment ID or by
+	 * URL — is owned by (or usable by) the current user.
 	 *
 	 * Shared by the normal ({@see validate_fields()}) and the draft-save submission paths so a
 	 * draft save cannot bind another user's attachment (e.g. as a company logo / featured image)
 	 * — the draft path skips validate_fields() and would otherwise reach the sink unchecked.
 	 *
 	 * @since 2.4.6
+	 * @since 2.4.10 URL values are validated too, not only attachment IDs.
 	 *
 	 * @param array $values Submitted input values.
 	 * @return bool|WP_Error True when all referenced attachments are authorized, WP_Error otherwise.
@@ -1036,12 +1059,83 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 								)
 							);
 						}
+					} else {
+						$file_url = esc_url( (string) $file_url, [ 'http', 'https' ] );
+
+						// An empty escape result is rejected by validate_fields(), and create_attachment() drops it.
+						if ( '' !== $file_url && ! $this->is_usable_file_url( $file_url, $group_key, $key ) ) {
+							return new WP_Error(
+								'validation-error',
+								sprintf(
+									// translators: Placeholder %s is the label of the file field, e.g. "Company Logo".
+									__( 'The saved file for "%s" is no longer available to use. Please upload it again, or remove it, and resubmit.', 'wp-job-manager' ),
+									$field['label']
+								)
+							);
+						}
 					}
 				}
 			}
 		}
 
 		return true;
+	}
+
+	/**
+	 * Whether the current user may reference the given file URL in a file field: it has to be
+	 * already saved on the listing being edited, be a file the current visitor uploaded through
+	 * a WP Job Manager form, or resolve to a media library attachment they may use.
+	 *
+	 * Unlike numeric values, which always reference media library attachments, a file field URL
+	 * usually names a fresh upload that only becomes an attachment when the listing is saved —
+	 * so ownership has to be established from the upload itself, not from the media library.
+	 *
+	 * @since 2.4.10
+	 *
+	 * @param string $file_url  File URL, escaped by `esc_url()`.
+	 * @param string $group_key Field group key.
+	 * @param string $key       Field key.
+	 * @return bool
+	 */
+	protected function is_usable_file_url( $file_url, $group_key, $key ) {
+		if ( $this->is_existing_listing_file_url( $file_url, $key ) ) {
+			return true;
+		}
+
+		if ( job_manager_is_submitter_uploaded_file( $file_url ) ) {
+			return true;
+		}
+
+		// A URL that resolves to a media library attachment may be used under the same rules
+		// as a numeric attachment reference.
+		$attachment_id = attachment_url_to_postid( $file_url );
+
+		return $attachment_id && $this->is_usable_attachment( $attachment_id, $group_key, $key );
+	}
+
+	/**
+	 * Determines whether a file URL is already the persisted value of a file field on the
+	 * listing currently being edited. Like {@see is_existing_listing_attachment()}, this
+	 * carries a value forward that is already bound to a listing the current user may edit,
+	 * not an arbitrary request-supplied URL: $this->job_id is set only for a listing the
+	 * current user may edit or is mid-submitting.
+	 *
+	 * @since 2.4.10
+	 *
+	 * @param string $file_url File URL, escaped by `esc_url()`.
+	 * @param string $key      Field key.
+	 * @return bool
+	 */
+	protected function is_existing_listing_file_url( $file_url, $key ) {
+		if ( ! $this->job_id ) {
+			return false;
+		}
+
+		$existing = get_post_meta( $this->job_id, '_' . $key, true );
+		$existing = is_array( $existing ) ? $existing : [ $existing ];
+		$existing = array_map( 'esc_url', array_filter( $existing, 'is_string' ) );
+
+		return in_array( $file_url, $existing, true );
 	}
 
 	/**
@@ -1122,8 +1216,13 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 			return false;
 		}
 
-		// The user owns the attachment (the normal case: they uploaded it).
-		if ( get_current_user_id() === (int) $attachment->post_author ) {
+		// The user owns the attachment (the normal case: they uploaded it). User 0 never owns
+		// anything: guest uploads are stored with post_author 0 and a logged-out visitor's ID
+		// is also 0, which must not make every guest the owner of every guest upload. A guest's
+		// own files are covered by the per-visitor upload record and by the listing they are
+		// mid-submitting ({@see is_existing_listing_attachment()}).
+		$user_id = get_current_user_id();
+		if ( $user_id && $user_id === (int) $attachment->post_author ) {
 			return true;
 		}
 
@@ -1359,7 +1458,11 @@ class WP_Job_Manager_Form_Submit_Job extends WP_Job_Manager_Form {
 					} else {
 						set_post_thumbnail( $this->job_id, $attachment_id );
 					}
-					update_user_meta( get_current_user_id(), '_company_logo', $attachment_id );
+
+					// Guests have no saved company values; user 0 must not accumulate shared meta.
+					if ( is_user_logged_in() ) {
+						update_user_meta( get_current_user_id(), '_company_logo', $attachment_id );
+					}
 
 					// Save meta data.
 				} else {

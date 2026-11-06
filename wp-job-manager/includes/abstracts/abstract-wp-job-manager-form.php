@@ -107,8 +107,10 @@ abstract class WP_Job_Manager_Form {
 		$job_id         = wp_unslash( $_COOKIE['wp-job-manager-submitting-job-id'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Cast to an integer below.
 		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 
-		// Request values can be arrays, which can't be a key or an ID.
-		if ( ! is_string( $submitting_key ) || ! is_string( $requested_key ) || ! is_string( $job_id ) ) {
+		// Request values can be arrays, which can't be a key or an ID. An empty key can't be
+		// one either: a listing that never had a submitting key stores no meta, and the ''
+		// the meta lookup returns must not match an empty cookie.
+		if ( ! is_string( $submitting_key ) || '' === $submitting_key || ! is_string( $requested_key ) || ! is_string( $job_id ) ) {
 			return false;
 		}
 
@@ -447,12 +449,18 @@ abstract class WP_Job_Manager_Form {
 	 * Validate a agreement checkbox field.
 	 *
 	 * @since 1.35.2
+	 * @since 2.4.10 Accepts `$is_saving_draft` and skips the check for draft saves.
 	 *
 	 * @param bool $success
+	 * @param bool $is_saving_draft Whether the submission is a draft save, which skips the checkbox.
 	 *
 	 * @return bool|WP_Error
 	 */
-	public function validate_agreement_checkbox( $success ) {
+	public function validate_agreement_checkbox( $success, $is_saving_draft = false ) {
+		if ( $is_saving_draft ) {
+			return $success;
+		}
+
 		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Check only.
 		if ( empty( $_POST['agreement-checkbox'] ) ) {
 			return new WP_Error( 'validation-error', esc_html__( 'Terms and Conditions is a required field', 'wp-job-manager' ) );
@@ -695,7 +703,27 @@ abstract class WP_Job_Manager_Form {
 			call_user_func( $field['before_sanitize'], $value );
 		}
 
-		return false !== $value ? trim( wp_kses_post( $value ) ) : '';
+		$value = false !== $value ? trim( wp_kses_post( $value ) ) : '';
+
+		if ( '' === $value || $this->can_submit_unrestricted_html() ) {
+			return $value;
+		}
+
+		return WP_Job_Manager_Post_Types::restrict_content_html( $value );
+	}
+
+	/**
+	 * Whether the current user's submitted HTML is stored as it was posted. Mirrors the trust
+	 * check used when listing content is displayed; here the submission may not have a post
+	 * yet, so the check is on the user submitting the form.
+	 *
+	 * @since 2.4.10
+	 *
+	 * @return bool
+	 */
+	protected function can_submit_unrestricted_html() {
+		/** This filter is documented in includes/class-wp-job-manager-post-types.php */
+		return (bool) apply_filters( 'job_manager_job_description_allow_shortcodes', current_user_can( WP_Job_Manager_Post_Types::CAP_EDIT_LISTINGS ), null );
 	}
 
 	/**
