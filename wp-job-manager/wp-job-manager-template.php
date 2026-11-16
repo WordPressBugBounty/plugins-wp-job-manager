@@ -252,7 +252,7 @@ function get_the_job_application_method( $post = null ) {
 			$apply = 'http://' . $apply;
 		}
 		$method->type = 'url';
-		$method->url  = $apply;
+		$method->url  = wpjm_esc_listing_url( $apply, $post );
 	}
 
 	return apply_filters( 'the_job_application_method', $method, $post );
@@ -557,7 +557,11 @@ function wpjm_get_the_job_title( $post = null ) {
 function wpjm_the_job_description( $post = null ) {
 	$job_description = wpjm_get_the_job_description( $post );
 	if ( $job_description ) {
+		ob_start();
 		WP_Job_Manager_Post_Types::output_kses_post( $job_description );
+
+		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Filtered above. Shortcodes are expanded afterwards, as they were when the content filters expanded them.
+		echo WP_Job_Manager_Post_Types::expand_description_shortcodes( ob_get_clean(), $post );
 	}
 }
 
@@ -575,7 +579,9 @@ function wpjm_get_the_job_description( $post = null ) {
 	}
 
 	$description = \WP_Job_Manager_Post_Types::restrict_listing_content( wp_kses_post( $post->post_content ), $post );
+	$was_holding = \WP_Job_Manager_Post_Types::hold_description_shortcodes( true );
 	$description = apply_filters( 'the_job_description', $description, $post );
+	\WP_Job_Manager_Post_Types::hold_description_shortcodes( $was_holding );
 
 	/**
 	 * Filter for the job description.
@@ -832,7 +838,32 @@ function wpjm_esc_listing_text( $text, $post = null ) {
 		return $text;
 	}
 
-	return WP_Job_Manager_Post_Types::encode_brackets( $text );
+	// A field can hold markup, when it was imported or saved by an older version. Inside tags the brackets are percent-encoded.
+	return WP_Job_Manager_Post_Types::encode_brackets( WP_Job_Manager_Post_Types::encode_brackets_in_tags( $text ) );
+}
+
+/**
+ * Prepares a URL from a listing field for display: unless the listing is trusted, bracket
+ * characters in it are percent-encoded, however they were written.
+ *
+ * @since 2.4.12
+ *
+ * @param string           $url  URL, not yet escaped for output.
+ * @param int|WP_Post|null $post Job listing (default: the current post).
+ * @return string
+ */
+function wpjm_esc_listing_url( $url, $post = null ) {
+	$post = get_post( $post );
+
+	if ( ! is_string( $url ) || '' === $url || ! $post || \WP_Job_Manager_Post_Types::PT_LISTING !== $post->post_type ) {
+		return $url;
+	}
+
+	if ( WP_Job_Manager_Post_Types::is_trusted_listing( $post ) ) {
+		return $url;
+	}
+
+	return WP_Job_Manager_Post_Types::encode_brackets_in_url( $url );
 }
 
 /**
@@ -1137,7 +1168,7 @@ function get_the_company_website( $post = null ) {
 		$website = 'http://' . $website;
 	}
 
-	return apply_filters( 'the_company_website', $website, $post );
+	return wpjm_esc_listing_url( apply_filters( 'the_company_website', $website, $post ), $post );
 }
 
 /**
@@ -1201,7 +1232,7 @@ function the_company_twitter( $before = '', $after = '', $echo = true, $post = n
 		return null;
 	}
 
-	$twitter_url     = wpjm_esc_listing_text( esc_url( 'https://x.com/' . $company_twitter ), $post );
+	$twitter_url     = esc_url( wpjm_esc_listing_url( 'https://x.com/' . $company_twitter, $post ) );
 	$twitter_text    = wpjm_esc_listing_text( esc_html( wp_strip_all_tags( $company_twitter ) ), $post );
 	$company_twitter = $before . '<a href="' . $twitter_url . '" class="company_twitter">' . $twitter_text . '</a>' . $after;
 
